@@ -1,15 +1,6 @@
-use std::{thread, time::Duration};
+use learning_rust::{currency_1, thread_1};
 fn main() {
-    println!("main thread");
-    let handler = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(10000));
-        println!("sub thread 1");
-        let handler1 = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(20000));
-            println!("sub thread 2");
-        });
-        // handler1.join().unwrap();
-    });
-    thread::sleep(Duration::from_millis(50000));
-    // handler.join().unwrap();
+    // thread_1::spawn_1();
+    // currency_1::shared_data_2();
+    currency_1::shared_data_1();
 }
