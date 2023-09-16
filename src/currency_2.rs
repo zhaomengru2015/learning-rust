@@ -1,4 +1,8 @@
-use std::thread;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    thread,
+};
 
 use crossbeam_channel::unbounded;
 
@@ -8,7 +12,7 @@ enum WorkMsg {
 }
 
 enum ResultMsg {
-    Result(u8),
+    Result(u8, WorkPerformed),
     Exited,
 }
 
@@ -42,6 +46,14 @@ impl WorkerState {
     }
 }
 
+#[derive(Eq, Debug, PartialEq)]
+enum WorkPerformed {
+    FromCache,
+    New,
+}
+#[derive(Eq, Hash, PartialEq)]
+struct CacheKey(u8);
+
 // 主组件和子组件之间的通信
 pub fn servo_channel_1() {
     let (worker_sender, worker_receiver) = unbounded();
@@ -55,6 +67,7 @@ pub fn servo_channel_1() {
         ongoing: 0,
         existing: false,
     };
+    let cache: Arc<Mutex<HashMap<CacheKey, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let handler = thread::spawn(move || loop {
         // 使用crossbeam选择一个就绪的工作
         select! {
@@ -63,13 +76,31 @@ pub fn servo_channel_1() {
                     Ok(WorkMsg::Work(num)) => {
                         let result_sender = result_sender.clone();
                         let pool_result_sender = pool_result_sender.clone();
+                        let cache = cache.clone();
                         // 池上启动一个新的工作单元
                         worker_state.set_ongoing(1);
                         pool.spawn( move ||{
+                            let num = {
+                                // 缓存开始
+                                let cache = cache.lock().unwrap();
+                                let key = CacheKey(num);
+                                if let Some(result) = cache.get(&key) {
+                                    // 从缓存中获得一个结果，并将其发送回去，
+                                    // 同时带有一个标志，表明是从缓存中获得了它
+                                    let _ = result_sender.send(ResultMsg::Result(result.clone(), WorkPerformed::FromCache));
+                                    let _ = pool_result_sender.send(());
+                                    return;
+                                }
+                                key.0
+                                // 缓存结束
+                            };
                             //1. 发送结果给主组件
-                            let _ = result_sender.send(ResultMsg::Result(num + 100u8));
+                            let _ = result_sender.send(ResultMsg::Result(num + 100u8,WorkPerformed::New));
+                            // 在缓存中存储“昂贵”的work.
+                            let mut cache = cache.lock().unwrap();
+                            let key = CacheKey(num.clone());
+                            cache.insert(key, num);
                             //2. 让并行组件知道这里完成了一个工作单元
-                            println!("worker finished work {:?}", worker_state.ongoing);
                             let _ = pool_result_sender.send(());
                         });
                     }
@@ -100,18 +131,23 @@ pub fn servo_channel_1() {
     });
 
     let _ = worker_sender.send(WorkMsg::Work(1));
+    // 发送两个相同的work
+    let _ = worker_sender.send(WorkMsg::Work(2));
     let _ = worker_sender.send(WorkMsg::Work(2));
     let _ = worker_sender.send(WorkMsg::Exit);
     let mut counter = 0;
     loop {
         match result_receiver.recv() {
-            Ok(ResultMsg::Result(num)) => {
-                println!("received result {:?}", num);
+            Ok(ResultMsg::Result(num, worker_performed)) => {
+                println!(
+                    "received result {:?}, worker_performed {:?}",
+                    num, worker_performed
+                );
                 counter += 1;
             }
             Ok(ResultMsg::Exited) => {
                 println!("worker finished");
-                assert_eq!(2, counter);
+                assert_eq!(3, counter);
                 break;
             }
             _ => panic!("Error receiving a ResultMsg"),
