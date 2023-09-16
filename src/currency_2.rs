@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     thread,
 };
 
@@ -54,6 +54,12 @@ enum WorkPerformed {
 #[derive(Eq, Hash, PartialEq)]
 struct CacheKey(u8);
 
+#[derive(Debug, Eq, PartialEq)]
+enum CacheState {
+    Ready,
+    WorkInProgress,
+}
+
 // 主组件和子组件之间的通信
 pub fn servo_channel_1() {
     let (worker_sender, worker_receiver) = unbounded();
@@ -68,6 +74,9 @@ pub fn servo_channel_1() {
         existing: false,
     };
     let cache: Arc<Mutex<HashMap<CacheKey, u8>>> = Arc::new(Mutex::new(HashMap::new()));
+    // 增加缓存状态，指示对于给定的key，缓存是否已经准备好被读取。
+    let cache_state: Arc<Mutex<HashMap<CacheKey, Arc<(Mutex<CacheState>, Condvar)>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let handler = thread::spawn(move || loop {
         // 使用crossbeam选择一个就绪的工作
         select! {
@@ -76,31 +85,88 @@ pub fn servo_channel_1() {
                     Ok(WorkMsg::Work(num)) => {
                         let result_sender = result_sender.clone();
                         let pool_result_sender = pool_result_sender.clone();
+
+                        // 使用缓存
                         let cache = cache.clone();
+                        let cache_state = cache_state.clone();
+
                         // 池上启动一个新的工作单元
                         worker_state.set_ongoing(1);
+
                         pool.spawn( move ||{
                             let num = {
-                                // 缓存开始
-                                let cache = cache.lock().unwrap();
-                                let key = CacheKey(num);
-                                if let Some(result) = cache.get(&key) {
+                                let (cache_state_lock, cvar) = {
+                                    // cache_state 临界区开始
+                                    let mut state_map = cache_state.lock().unwrap();
+                                    &*state_map
+                                    .entry(CacheKey(num.clone()))
+                                    .or_insert_with(||{
+                                        Arc::new((Mutex::new(CacheState::Ready), Condvar::new()))
+                                    }).clone()
+                                    //  `cache_state` 临界区结束
+                                };
+
+                                //state 临界区开始
+                                let mut state =  cache_state_lock.lock().unwrap();
+
+                                // 注意：使用while循环来防止条件变量的虚假唤醒
+                                while let CacheState::WorkInProgress = *state {
+                                    //阻塞直到状态为Ready
+                                    let current_state = cvar.wait(state)
+                                    .unwrap();
+                                    state = current_state;
+                                };
+
+                                assert_eq!(*state, CacheState::Ready);
+                                let (num, result) = {
+                                    //缓存临界区开始
+                                    let cache = cache.lock().unwrap();
+                                    let key = CacheKey(num);
+                                    let result = match cache.get(&key) {
+                                        Some(result)=>Some(result.clone()),
+                                        None=>None,
+                                    };
+                                    (key.0, result)
+                                    // 缓存临界区结束
+                                };
+                                if let Some(result) = result {
                                     // 从缓存中获得一个结果，并将其发送回去，
                                     // 同时带有一个标志，表明是从缓存中获得了它
-                                    let _ = result_sender.send(ResultMsg::Result(result.clone(), WorkPerformed::FromCache));
+                                    let _ = result_sender.send(ResultMsg::Result(result, WorkPerformed::FromCache));
                                     let _ = pool_result_sender.send(());
+                                    // 不要忘记通知等待线程
+                                    cvar.notify_one();
                                     return;
+                                }else{
+                                    *state = CacheState::WorkInProgress;
+                                    num
                                 }
-                                key.0
-                                // 缓存结束
+                                // `state` 临界区结束
                             };
-                            //1. 发送结果给主组件
-                            let _ = result_sender.send(ResultMsg::Result(num + 100u8,WorkPerformed::New));
-                            // 在缓存中存储“昂贵”的work.
-                            let mut cache = cache.lock().unwrap();
-                            let key = CacheKey(num.clone());
-                            cache.insert(key, num);
-                            //2. 让并行组件知道这里完成了一个工作单元
+
+                            //1. 在临界区外做更多「昂贵工作」
+                            let _ = result_sender.send(ResultMsg::Result(num,WorkPerformed::New));
+                            {
+                                // 在缓存中存储“昂贵”的work.
+                                let mut cache = cache.lock().unwrap();
+                                let key = CacheKey(num.clone());
+                                cache.insert(key, num);
+                                // 缓存临界区结束
+                            }
+
+                            let (lock, cvar) = {
+                                let mut state_map = cache_state.lock().unwrap();
+                                &*state_map
+                                    .get_mut(&CacheKey(num))
+                                    .expect("Entry in cache state to have been previously inserted")
+                                    .clone()
+                            };
+
+                            //重新进入state 临界区
+                            let mut state = lock.lock().unwrap();
+                            assert_eq!(*state, CacheState::WorkInProgress);
+                            *state = CacheState::Ready;
+                            cvar.notify_one();
                             let _ = pool_result_sender.send(());
                         });
                     }
@@ -116,7 +182,6 @@ pub fn servo_channel_1() {
                 }
             },
             recv(pool_result_receiver) -> _ =>{
-                println!("pool_result_receiver received finished work {:?}", worker_state.ongoing);
                 if worker_state.is_no_more_work() {
                     panic!("Received an unexpected pool result");
                 }
